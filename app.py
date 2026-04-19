@@ -4,18 +4,41 @@ from src.core.hospedajes_client import HospedajesClient
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from src.core.iso_countries import get_iso_countries
+
+# --- Load Environment Variables ---
+# override=True ensures .env values take precedence over system env vars
+load_dotenv(override=True)
+
+# Streamlit secrets integration for local development
+if os.path.exists("secrets.toml"):
+    try:
+        import toml
+        secrets = toml.load("secrets.toml")
+        for k, v in secrets.items():
+            os.environ[k] = str(v)
+    except Exception as e:
+        print(f"Error loading secrets.toml: {e}")
 
 # Optional DB Manager
 try:
+    from src.core import db_manager
+    import importlib
+    importlib.reload(db_manager)
     from src.core.db_manager import get_db
     DB_AVAILABLE = True
 except Exception as e:
     DB_AVAILABLE = False
     print(f"Database not available: {e}")
 
-# --- Load Environment Variables ---
-# override=True ensures .env values take precedence over system env vars
-load_dotenv(override=True)
+try:
+    from src.core import auth
+except ImportError:
+    auth = None
+
+# --- Auth State ---
+if 'user' not in st.session_state:
+    st.session_state.user = None
 
 import warnings
 # Suppress specific cryptography warning about PKCS#12 format
@@ -127,34 +150,194 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- Authentication UI ---
+if not st.session_state.user:
+    st.markdown("<h1 style='text-align: center;'>Bienvenido a Mirador</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #a0a0a0;'>Plataforma de Registro de Huéspedes (RD 933/2021)</p>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        tab_login, tab_register = st.tabs(["Iniciar Sesión", "Registrarse"])
+        
+        with tab_login:
+            with st.form("login_form"):
+                log_email = st.text_input("Correo Electrónico")
+                log_pass = st.text_input("Contraseña", type="password")
+                if st.form_submit_button("Entrar", type="primary"):
+                    user_data = get_db().get_user_by_email(log_email)
+                    if user_data and auth and auth.verify_password(user_data['password_hash'], log_pass):
+                        if not user_data['subscription_active'] and user_data['role'] != 'admin':
+                            st.error("Tu suscripción no está activa. Por favor, realiza el pago o contacta con soporte.")
+                        else:
+                            st.session_state.user = user_data
+                            st.rerun()
+                    else:
+                        st.error("Credenciales incorrectas")
+        
+        with tab_register:
+            with st.form("register_form"):
+                st.subheader("Datos de Acceso")
+                reg_email = st.text_input("Correo Electrónico *")
+                reg_pass = st.text_input("Contraseña *", type="password")
+                reg_pass2 = st.text_input("Confirmar Contraseña *", type="password")
+                
+                st.subheader("Datos del Establecimiento (MIR)")
+                reg_nombre = st.text_input("Nombre Comercial del Establecimiento *")
+                reg_mir_user = st.text_input("Usuario MIR (CIF/NIF) *")
+                reg_mir_pass = st.text_input("Contraseña MIR *", type="password")
+                reg_arr = st.text_input("Código Arrendador *")
+                reg_est = st.text_input("Código Establecimiento *")
+                
+                if st.form_submit_button("Crear Cuenta y Establecimiento", type="primary"):
+                    if reg_pass != reg_pass2:
+                        st.error("Las contraseñas no coinciden")
+                    elif not reg_email or not reg_nombre or not reg_arr or not reg_est or not reg_mir_user:
+                        st.error("Por favor, rellena todos los campos obligatorios")
+                    elif get_db().get_user_by_email(reg_email):
+                        st.error("Ya existe una cuenta con ese correo")
+                    else:
+                        role = 'admin' if reg_email == 'admin@mirador.com' else 'user'
+                        # Simulamos que la suscripción está activa por ahora
+                        new_user_id = get_db().create_user(reg_email, auth.hash_password(reg_pass), role, True)
+                        if new_user_id:
+                            # Creamos automáticamente el tenant para este usuario
+                            import re
+                            slug_base = re.sub(r'[^a-z0-9]', '', reg_nombre.lower())[:15]
+                            tenant_slug = f"{slug_base}_{new_user_id}"
+                            
+                            get_db().save_tenant({
+                                'tenant_id': tenant_slug,
+                                'owner_id': new_user_id,
+                                'nombre': reg_nombre,
+                                'mir_user': reg_mir_user,
+                                'mir_password': reg_mir_pass,
+                                'arrendador_code': reg_arr,
+                                'establecimiento_code': reg_est,
+                                'p12_path': '',
+                                'p12_password': ''
+                            })
+                            st.success("Cuenta creada exitosamente. Por favor, inicia sesión en la pestaña 'Iniciar Sesión'.")
+                        else:
+                            st.error("Error al crear la cuenta")
+    
+    st.stop() # Stop rendering the dashboard if not logged in
+
+# Top bar for logged in users
+col_user1, col_user2 = st.columns([8, 1])
+with col_user2:
+    if st.button("Cerrar Sesión"):
+        st.session_state.user = None
+        st.rerun()
+
+
+# --- Multi-tenant state ---
+current_tenant_id = "GLOBAL"
+tenant_config = None
+
 # --- Sidebar: Configuration ---
 with st.sidebar:
     st.title("⚙️ Configuración")
     
-    with st.expander("🌐 Endpoints", expanded=True):
-        env = st.selectbox("Entorno", ["Pruebas", "Producción", "Custom"])
-        if env == "Pruebas":
-            endpoint = "https://hospedajes.pre-ses.mir.es/hospedajes-web/ws/v1/comunicacion"
-        elif env == "Producción":
-            endpoint = "https://hospedajes.ses.mir.es/hospedajes-web/ws/v1/comunicacion"
-        else:
-            endpoint = st.text_input("Endpoint URL", "")
+    # --- Multi-tenant Support ---
+    if DB_AVAILABLE:
+        st.subheader("🏢 Establecimiento / Inquilino")
+        
+        # Admin gets all tenants, regular users get only theirs
+        user_role = st.session_state.user.get('role', 'user')
+        user_id = st.session_state.user.get('id')
+        
+        if user_role == 'admin':
+            tenants = get_db().get_tenants()
+            tenant_options = {t['tenant_id']: t['nombre'] for t in tenants}
             
-        wsdl = st.text_input("WSDL Path/URL", "schemas/comunicacion.wsdl")
+            selected_tenant_id = st.selectbox(
+                "Seleccionar Establecimiento",
+                options=["-- Nuevo --"] + list(tenant_options.keys()),
+                format_func=lambda x: tenant_options.get(x, "Añadir nuevo...")
+            )
+            current_tenant_id = selected_tenant_id if selected_tenant_id != "-- Nuevo --" else "GLOBAL"
+            
+            if selected_tenant_id != "-- Nuevo --":
+                tenant_config = get_db().get_tenant_config(selected_tenant_id)
+                if tenant_config:
+                    st.info(f"Conectado a: **{tenant_config['nombre']}**")
+            else:
+                with st.expander("🆕 Registrar Nuevo Establecimiento", expanded=False):
+                    with st.form("new_tenant_form"):
+                        nt_id = st.text_input("ID Único (Slug)", placeholder="hotel_playa")
+                        nt_nombre = st.text_input("Nombre Comercial", placeholder="Hotel Playa Salobreña")
+                        nt_user = st.text_input("MIR User")
+                        nt_pass = st.text_input("MIR Password", type="password")
+                        nt_arr = st.text_input("Cód. Arrendador")
+                        nt_est = st.text_input("Cód. Establecimiento")
+                        
+                        if st.form_submit_button("Guardar Establecimiento"):
+                            if nt_id and nt_nombre:
+                                get_db().save_tenant({
+                                    'tenant_id': nt_id, 
+                                    'owner_id': user_id,
+                                    'nombre': nt_nombre,
+                                    'mir_user': nt_user, 'mir_password': nt_pass,
+                                    'arrendador_code': nt_arr, 'establecimiento_code': nt_est,
+                                    'p12_path': '', 'p12_password': ''
+                                })
+                                st.success("Establecimiento guardado!")
+                                st.rerun()
+                            else:
+                                st.error("ID y Nombre son obligatorios")
+        else:
+            # Regular user: auto-load their only tenant
+            tenants = get_db().get_tenants(owner_id=user_id)
+            if tenants:
+                current_tenant_id = tenants[0]['tenant_id']
+                tenant_config = get_db().get_tenant_config(current_tenant_id)
+                st.info(f"Conectado a: **{tenant_config['nombre']}**")
+            else:
+                st.error("No tienes ningún establecimiento asignado. Contacta con soporte.")
+                st.stop()
+                
+        st.divider()
+    
+    # Hide global settings for regular users
+    if st.session_state.user.get('role') == 'admin':
+        with st.expander("🌐 Endpoints", expanded=False):
+            env = st.selectbox("Entorno", ["Pruebas", "Producción", "Custom"])
+            if env == "Pruebas":
+                endpoint = "https://hospedajes.pre-ses.mir.es/hospedajes-web/ws/v1/comunicacion"
+            elif env == "Producción":
+                endpoint = "https://hospedajes.ses.mir.es/hospedajes-web/ws/v1/comunicacion"
+            else:
+                endpoint = st.text_input("Endpoint URL", "")
+                
+            wsdl = st.text_input("WSDL Path/URL", "schemas/comunicacion.wsdl")
+            
+        mock_mode = st.toggle("🚀 Modo Mock (Sin red)", value=get_env_bool("MODO_MOCK", "True"))
+    else:
+        # Defaults for non-admin
+        endpoint = "https://hospedajes.ses.mir.es/hospedajes-web/ws/v1/comunicacion"
+        wsdl = "schemas/comunicacion.wsdl"
+        mock_mode = get_env_bool("MODO_MOCK", "False")
         
     with st.expander("🔐 Autenticación", expanded=True):
-        user = st.text_input("Usuario (CIF/NIF)", value=os.getenv("MIR_USER", ""))
-        pwd = st.text_input("Contraseña", type="password", value=os.getenv("MIR_PASSWORD", ""))
-        cod_arrendador = st.text_input("Código Arrendador", value=os.getenv("MIR_ARRENDADOR_CODE", ""))
+        user = st.text_input("Usuario (CIF/NIF)", value=tenant_config['mir_user'] if tenant_config else os.getenv("MIR_USER", ""))
+        pwd = st.text_input("Contraseña", type="password", value=tenant_config['mir_password'] if tenant_config else os.getenv("MIR_PASSWORD", ""))
+        cod_arrendador = st.text_input("Código Arrendador", value=tenant_config['arrendador_code'] if tenant_config else os.getenv("MIR_ARRENDADOR_CODE", ""))
+        cod_est = st.text_input("Código Establecimiento", value=tenant_config['establecimiento_code'] if tenant_config else os.getenv("MIR_ESTABLECIMIENTO_CODE", ""))
         app_name = st.text_input("Nombre Aplicación", value=os.getenv("MIR_APP_NAME", "PythonClient_v1"))
         
-    with st.expander("📜 Certificados (SSL)", expanded=False):
-        cert_file = st.file_uploader("Certificado (.pem/.crt/.p12)", type=["pem", "crt", "p12", "pfx"])
-        p12_password = st.text_input("Contraseña Certificado (.p12)", type="password", value=os.getenv("MIR_P12_PASSWORD", ""), help="Solo necesaria si subes un archivo .p12")
-        key_file = st.file_uploader("Clave Privada (.key)", type=["key"], help="Opcional si usas .p12")
-        verify_ssl = st.checkbox("Verificar SSL (CA)", value=get_env_bool("MODO_SSL", "True"), help="Desactiva esto solo si tienes errores de 'unable to get local issuer certificate' en pruebas.")
+    with st.expander("📜 Certificados (SSL) - Obligatorio para Enviar", expanded=True):
+        st.info("Por seguridad, no almacenamos tu certificado. Debes subirlo cada vez que inicies sesión para realizar envíos.")
+        cert_file = st.file_uploader("Certificado Digital (.p12 / .pfx)", type=["p12", "pfx"])
+        p12_password = st.text_input("Contraseña del Certificado", type="password", help="La contraseña de tu archivo .p12")
         
-    mock_mode = st.toggle("🚀 Modo Mock (Sin red)", value=get_env_bool("MODO_MOCK", "True"))
+        # Oculto de la UI para mayor limpieza, toma el valor de entorno por defecto
+        verify_ssl = get_env_bool("MODO_SSL", "True")
+        
+        # We set p12_path_ui to None since we only use the uploaded file
+        p12_path_ui = None
+        key_file = None
+        
+
 
 
 # --- Session State ---
@@ -176,8 +359,9 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 def get_client():
     c_path = os.getenv("MIR_CERT_PATH", "")
     k_path = os.getenv("MIR_KEY_PATH", "")
-    p12_path = os.getenv("MIR_P12_PATH", "")
-    p12_pass = p12_password if p12_password else os.getenv("MIR_P12_PASSWORD", "")
+    p12_path = p12_path_ui
+    p12_pass = p12_password
+    
     
     # Only use env paths if they actually exist
     if c_path and not os.path.exists(c_path):
@@ -274,15 +458,15 @@ def get_client():
 
 # --- Catalog Helper ---
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_catalog(tipo, defaults):
+def load_catalog(tipo, defaults, tenant_id="GLOBAL"):
     mapping = {k: k for k in defaults}
     if DB_AVAILABLE:
         try:
-            db_data = get_db().get_catalogo(tipo)
+            db_data = get_db().get_catalogo(tipo, tenant_id=tenant_id)
             if db_data:
                 mapping = {item['codigo']: f"{item['codigo']} - {item['descripcion']}" for item in db_data}
         except Exception as e:
-            st.warning(f"No se pudo cargar el catálogo {tipo}: {e}")
+            st.warning(f"No se pudo cargar el catálogo {tipo} para {tenant_id}: {e}")
     return mapping
 
 # --- Main Content ---
@@ -301,7 +485,10 @@ with h_col2:
     """, unsafe_allow_html=True)
 st.markdown("<div style='margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
 
-tabs = st.tabs(["📤 Alta", "🔍 Consultas", "❌ Anulaciones", "📚 Catálogo"])
+if st.session_state.user.get('role') == 'admin':
+    tabs = st.tabs(["📤 Alta", "🔍 Consultas", "❌ Anulaciones", "📚 Catálogo"])
+else:
+    tabs = st.tabs(["📤 Alta", "🔍 Consultas", "❌ Anulaciones"])
 
 # --- TAB: Alta ---
 with tabs[0]:
@@ -347,7 +534,7 @@ with tabs[0]:
         st.write("💳 Datos de Pago")
         p_col1, p_col2 = st.columns([1, 3])
         with p_col1:
-            cat_pago = load_catalog("TIPO_PAGO", ["EF", "TC", "TR", "OT"])
+            cat_pago = load_catalog("TIPO_PAGO", ["EF", "TC", "TR", "OT"], tenant_id="GLOBAL")
             tipo_pago = st.selectbox("💰 Tipo de Pago", options=list(cat_pago.keys()), format_func=lambda x: cat_pago[x], help="Selecciona según el catálogo oficial")
             f_pago = st.date_input("📆 Fecha de Pago", datetime.now())
             p_caducidad = st.text_input("💳 Caducidad Tarjeta", value="", placeholder="MM/AAAA", help="Solo para TC")
@@ -383,11 +570,11 @@ with tabs[0]:
                     p_soporte = st.text_input(label_soporte, "", key=f"soporte_{i}", help="Ej: IDESP... para NIF o E... para NIE")
                 
                 with v2:
-                    cat_tdoc = load_catalog("TIPO_DOCUMENTO", ["NIF", "NIE", "PAS", "ID"])
+                    cat_tdoc = load_catalog("TIPO_DOCUMENTO", ["NIF", "NIE", "PAS", "ID"], tenant_id="GLOBAL")
                     p_tdoc = st.selectbox(f"Tipo Doc P{i+1}", options=list(cat_tdoc.keys()), format_func=lambda x: cat_tdoc[x], key=f"tdoc_{i}")
                     p_doc = st.text_input(f"Documento P{i+1}", "", key=f"doc_{i}")
                     
-                    cat_sexo = load_catalog("SEXO", ["M", "F", "X"])
+                    cat_sexo = load_catalog("SEXO", ["M", "F", "X"], tenant_id="GLOBAL")
                     p_sexo = st.selectbox(f"Sexo P{i+1}", options=list(cat_sexo.keys()), format_func=lambda x: cat_sexo[x], key=f"sexo_{i}")
                     p_fnac = st.date_input(f"Fecha Nacimiento P{i+1}", datetime(1980, 1, 1), key=f"fnac_{i}")
                 
@@ -396,9 +583,17 @@ with tabs[0]:
                 
                 v3, v4 = st.columns(2)
                 with v3:
-                    p_nac = st.text_input(f"Nacionalidad P{i+1}", "", key=f"nac_{i}")
+                    iso_countries = get_iso_countries()
+                    country_list = list(iso_countries.keys())
+                    p_nac = st.selectbox(
+                        f"Nacionalidad P{i+1}", 
+                        options=country_list, 
+                        index=country_list.index("ESP") if "ESP" in country_list else 0,
+                        format_func=lambda x: f"{x} - {iso_countries[x]}", 
+                        key=f"nac_{i}"
+                    )
                 with v4:
-                    cat_parentesco = load_catalog("TIPO_PARENTESCO", ["", "P", "M", "A", "H", "O"])
+                    cat_parentesco = load_catalog("TIPO_PARENTESCO", ["", "P", "M", "A", "H", "O"], tenant_id="GLOBAL")
                     p_parentesco = st.selectbox(f"Parentesco P{i+1}", options=list(cat_parentesco.keys()), format_func=lambda x: cat_parentesco[x] if x else "Ninguno", key=f"par_{i}")
                     
                 p_rol = "VI"
@@ -417,12 +612,18 @@ with tabs[0]:
                 with d1:
                     d_dir = st.text_input(f"Dirección P{i+1}", "", key=f"dir_{i}")
                 with d2:
-                    cat_mun = load_catalog("MUNICIPIO", ["28079"])
+                    cat_mun = load_catalog("MUNICIPIO", ["28079"], tenant_id="GLOBAL")
                     d_mun = st.selectbox(f"Municipio P{i+1}", options=list(cat_mun.keys()), format_func=lambda x: cat_mun[x] if x in cat_mun else x, key=f"mun_{i}", help="Escribe para buscar el municipio")
                 with d3:
                     d_cp = st.text_input(f"CP P{i+1}", "", key=f"cp_{i}")
                 with d4:
-                    d_pais = st.text_input(f"País P{i+1}", "", key=f"dpais_{i}")
+                    d_pais = st.selectbox(
+                        f"País P{i+1}", 
+                        options=country_list, 
+                        index=country_list.index("ESP") if "ESP" in country_list else 0,
+                        format_func=lambda x: f"{x} - {iso_countries[x]}", 
+                        key=f"dpais_{i}"
+                    )
     
                 # Update session state with current values
                 st.session_state.viajeros[i]['nombre'] = p_nom
@@ -534,80 +735,81 @@ with tabs[2]:
             st.error("Debes introducir un número de lote válido.")
 
 # --- TAB: Catálogo ---
-with tabs[3]:
-    st.header("Consulta de Catálogos")
-    cat_target = st.selectbox("Catálogo", [
-        "SEXO", 
-        "TIPO_DOCUMENTO", 
-        "TIPO_MARCA_VEHICULO", 
-        "TIPO_PAGO", 
-        "TIPO_PARENTESCO", 
-        "TIPO_COLOR", 
-        "TIPO_ESTABLECIMIENTO", 
-        "TIPO_VEHICULO"
-    ])
-    
-    col_btn1, col_btn2 = st.columns(2)
-    
-    with col_btn1:
-        if st.button("🌐 Cargar del Ministerio"):
-            client = get_client()
-            res = client.catalogo(cat_target)
-            
-            if "error" in res:
-                st.error(res["error"])
-                if res.get("details"):
-                    st.info(res["details"])
+if st.session_state.user.get('role') == 'admin':
+    with tabs[3]:
+        st.header("Consulta de Catálogos")
+        cat_target = st.selectbox("Catálogo", [
+            "SEXO", 
+            "TIPO_DOCUMENTO", 
+            "TIPO_MARCA_VEHICULO", 
+            "TIPO_PAGO", 
+            "TIPO_PARENTESCO", 
+            "TIPO_COLOR", 
+            "TIPO_ESTABLECIMIENTO", 
+            "TIPO_VEHICULO"
+        ])
+        
+        col_btn1, col_btn2 = st.columns(2)
+        
+        with col_btn1:
+            if st.button("🌐 Cargar del Ministerio"):
+                client = get_client()
+                res = client.catalogo(cat_target)
                 
-                if res.get("fallback"):
-                    st.warning(f"Usando datos de respaldo (Offline) para {cat_target}")
-                    df = pd.DataFrame(res["local_data"])
-                    st.dataframe(df, use_container_width=True)
-            else:
-                st.success(f"Datos de {cat_target} cargados desde el servidor")
-                try:
-                    # Parse data
-                    if 'respuesta' in res and 'resultado' in res['respuesta']:
-                        data = res['respuesta']['resultado'].get('tupla', [])
-                        parsed_data = [{'codigo': t['codigo'], 'descripcion': t['descripcion']} for t in data]
-                    else:
-                        parsed_data = res.get('data', [])
+                if "error" in res:
+                    st.error(res["error"])
+                    if res.get("details"):
+                        st.info(res["details"])
                     
-                    df = pd.DataFrame(parsed_data)
-                    
-                    if not df.empty:
+                    if res.get("fallback"):
+                        st.warning(f"Usando datos de respaldo (Offline) para {cat_target}")
+                        df = pd.DataFrame(res["local_data"])
                         st.dataframe(df, use_container_width=True)
+                else:
+                    st.success(f"Datos de {cat_target} cargados desde el servidor")
+                    try:
+                        # Parse data
+                        if 'respuesta' in res and 'resultado' in res['respuesta']:
+                            data = res['respuesta']['resultado'].get('tupla', [])
+                            parsed_data = [{'codigo': t['codigo'], 'descripcion': t['descripcion']} for t in data]
+                        else:
+                            parsed_data = res.get('data', [])
                         
-                        # Save to DB automatically
-                        if DB_AVAILABLE:
-                            try:
-                                get_db().save_catalogo(cat_target, parsed_data)
-                                st.success(f"✅ Catálogo {cat_target} sincronizado en NeonDB.")
-                            except Exception as db_e:
-                                st.error(f"Error al guardar en BBDD: {db_e}")
-                    else:
-                        st.write("El catálogo está vacío o no se ha podido procesar.")
+                        df = pd.DataFrame(parsed_data)
+                        
+                        if not df.empty:
+                            st.dataframe(df, use_container_width=True)
+                            
+                            # Save to DB automatically
+                            if DB_AVAILABLE:
+                                try:
+                                    get_db().save_catalogo(cat_target, parsed_data, tenant_id="GLOBAL")
+                                    st.success(f"✅ Catálogo {cat_target} sincronizado en NeonDB para GLOBAL.")
+                                except Exception as db_e:
+                                    st.error(f"Error al guardar en BBDD: {db_e}")
+                        else:
+                            st.write("El catálogo está vacío o no se ha podido procesar.")
+                            st.json(res)
+                    except Exception as e:
                         st.json(res)
-                except Exception as e:
-                    st.json(res)
-                    st.error(f"Error al procesar el formato de respuesta: {e}")
+                        st.error(f"Error al procesar el formato de respuesta: {e}")
 
-    with col_btn2:
-        if st.button("🗄️ Cargar desde NeonDB"):
-            if not DB_AVAILABLE:
-                st.error("La conexión a la base de datos no está disponible.")
-            else:
-                try:
-                    db_data = get_db().get_catalogo(cat_target)
-                    if db_data:
-                        df = pd.DataFrame(db_data)
-                        st.success(f"Catálogo {cat_target} cargado desde NeonDB (Última act: {db_data[0].get('last_updated')})")
-                        st.dataframe(df, use_container_width=True)
-                    else:
-                        st.warning(f"El catálogo {cat_target} no está en la base de datos todavía. Por favor cárgalo desde el Ministerio primero.")
-                except Exception as db_e:
-                    st.error(f"Error al leer de la BBDD: {db_e}")
+        with col_btn2:
+            if st.button("🗄️ Cargar desde NeonDB"):
+                if not DB_AVAILABLE:
+                    st.error("La conexión a la base de datos no está disponible.")
+                else:
+                    try:
+                        db_data = get_db().get_catalogo(cat_target, tenant_id="GLOBAL")
+                        if db_data:
+                            df = pd.DataFrame(db_data)
+                            st.success(f"Catálogo {cat_target} cargado desde NeonDB (Última act: {db_data[0].get('last_updated')})")
+                            st.dataframe(df, use_container_width=True)
+                        else:
+                            st.warning(f"El catálogo {cat_target} no está en la base de datos todavía. Por favor cárgalo desde el Ministerio primero.")
+                    except Exception as db_e:
+                        st.error(f"Error al leer de la BBDD: {db_e}")
 
 # --- Footer ---
 st.divider()
-st.caption("MIR Hospedajes Python Client - Desarrollado para el cumplimiento del RD 933/2021.")
+st.caption("Mirador - Todos los derechos reservados 2026 - Desarrollado por SerLau Tech, LLC")
