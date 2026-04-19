@@ -2,7 +2,7 @@ import base64
 import io
 import zipfile
 import lxml.etree as ET
-from zeep import Client, Transport
+from zeep import Client, Transport, helpers
 from requests import Session
 import requests
 import urllib3
@@ -54,7 +54,7 @@ class HospedajesClient:
             if username and password:
                 session.auth = requests.auth.HTTPBasicAuth(username, password)
             
-            transport = Transport(session=session)
+            transport = Transport(session=session, timeout=15)
             self.client = Client(wsdl_path, transport=transport)
             
             if endpoint:
@@ -64,6 +64,14 @@ class HospedajesClient:
                 )
             else:
                 self.service = self.client.service
+            
+            self._session = session
+        else:
+            self._session = None
+
+    def close(self):
+        if self._session:
+            self._session.close()
 
     def _create_zip_base64(self, xml_content, filename="solicitud.xml"):
         zip_buffer = io.BytesIO()
@@ -74,7 +82,7 @@ class HospedajesClient:
     def generate_alta_parte_hospedaje_xml(self, cod_establecimiento, comunicaciones):
         # XML Schema defined namespaces
         NS_ALTA = "http://www.neg.hospedajes.mir.es/altaParteHospedaje"
-        NS_MAP = {None: NS_ALTA}
+        NS_MAP = {"alta": NS_ALTA}
         
         # Root element
         root = ET.Element(f"{{{NS_ALTA}}}peticion", nsmap=NS_MAP)
@@ -141,6 +149,10 @@ class HospedajesClient:
                 # 2.2.1 direccion (Mandatory inside persona)
                 dir_node = ET.SubElement(pers, "direccion")
                 ET.SubElement(dir_node, "direccion").text = p['direccion']['direccion']
+                
+                if p['direccion'].get('codigoMunicipio'):
+                    ET.SubElement(dir_node, "codigoMunicipio").text = p['direccion']['codigoMunicipio']
+                    
                 ET.SubElement(dir_node, "codigoPostal").text = p['direccion']['codigoPostal']
                 ET.SubElement(dir_node, "pais").text = p['direccion']['pais']
 
@@ -170,13 +182,92 @@ class HospedajesClient:
             
         try:
             response = self.service.comunicacion(peticion={'cabecera': cabecera, 'solicitud': payload})
-            return response
+            return helpers.serialize_object(response)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def consulta_lote(self, lista_lotes):
+        if self.mock_mode: return {"status": "MOCK", "lotes": lista_lotes}
+        try:
+            # En el WSDL: consultaLoteRequest -> codigosLote -> lote[]
+            response = self.service.consultaLote(codigosLote={'lote': lista_lotes})
+            return helpers.serialize_object(response)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def consulta_comunicacion(self, lista_codigos):
+        if self.mock_mode: return {"status": "MOCK", "codigos": lista_codigos}
+        try:
+            # En el WSDL: consultaComunicacionRequest -> codigos -> codigo[]
+            response = self.service.consultaComunicacion(codigos={'codigo': lista_codigos})
+            return helpers.serialize_object(response)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def anulacion_lote(self, numero_lote):
+        if self.mock_mode: return {"status": "MOCK", "anulado": numero_lote}
+        try:
+            response = self.service.anulacionLote(lote=numero_lote)
+            return helpers.serialize_object(response)
         except Exception as e:
             return {"error": str(e)}
 
     def catalogo(self, nombre_catalogo):
-        if self.mock_mode: return {"status": "MOCK"}
+        if self.mock_mode: return {"status": "MOCK", "data": self.get_local_catalogo(nombre_catalogo)}
+        
+        # Usamos los nombres oficiales de la documentación
+        target = nombre_catalogo
+        
         try:
-            return self.service.catalogo(peticion={'catalogo': nombre_catalogo})
+            response = self.service.catalogo(peticion={'catalogo': target})
+            return helpers.serialize_object(response)
         except Exception as e:
-            return {"error": str(e)}
+            error_msg = str(e)
+            if "502" in error_msg or "Proxy Error" in error_msg:
+                return {
+                    "error": "Error 502: El servidor del Ministerio no responde (Proxy Error).",
+                    "details": "Esto es común en el entorno de pruebas (PRE). Inténtalo más tarde.",
+                    "fallback": True,
+                    "local_data": self.get_local_catalogo(nombre_catalogo)
+                }
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                return {
+                    "error": "Error 401: No autorizado.",
+                    "details": "Tus credenciales (Usuario/Password) o tu Certificado no están autorizados para PRODUCCIÓN. Revisa el archivo .env.",
+                    "fallback": True,
+                    "local_data": self.get_local_catalogo(nombre_catalogo)
+                }
+            return {"error": error_msg}
+        
+        return helpers.serialize_object(response)
+
+    def get_local_catalogo(self, nombre_catalogo):
+        # Datos de respaldo basados en la documentación oficial
+        catalogos = {
+            "SEXO": [
+                {"codigo": "M", "descripcion": "VARÓN"},
+                {"codigo": "F", "descripcion": "MUJER"},
+                {"codigo": "X", "descripcion": "NO BINARIO / OTROS"}
+            ],
+            "TIPO_DOCUMENTO": [
+                {"codigo": "NIF", "descripcion": "NIF / DNI"},
+                {"codigo": "NIE", "descripcion": "NIE"},
+                {"codigo": "PAS", "descripcion": "PASAPORTE"},
+                {"codigo": "ID", "descripcion": "DOCUMENTO IDENTIDAD PAÍS"}
+            ],
+            "TIPO_PARENTESCO": [
+                {"codigo": "P", "descripcion": "PADRE"},
+                {"codigo": "M", "descripcion": "MADRE"},
+                {"codigo": "A", "descripcion": "ABUELO/A"},
+                {"codigo": "H", "descripcion": "HIJO/A"},
+                {"codigo": "T", "descripcion": "TUTOR/A"},
+                {"codigo": "O", "descripcion": "OTROS"}
+            ],
+            "TIPO_PAGO": [
+                {"codigo": "EF", "descripcion": "EFECTIVO"},
+                {"codigo": "TC", "descripcion": "TARJETA CRÉDITO"},
+                {"codigo": "TR", "descripcion": "TRANSFERENCIA"},
+                {"codigo": "OT", "descripcion": "OTROS"}
+            ]
+        }
+        return catalogos.get(nombre_catalogo, [])

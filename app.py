@@ -5,13 +5,33 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Optional DB Manager
+try:
+    from db_manager import get_db
+    DB_AVAILABLE = True
+except Exception as e:
+    DB_AVAILABLE = False
+    print(f"Database not available: {e}")
+
 # --- Load Environment Variables ---
 # override=True ensures .env values take precedence over system env vars
 load_dotenv(override=True)
 
+import warnings
+# Suppress specific cryptography warning about PKCS#12 format
+warnings.filterwarnings("ignore", category=UserWarning, message=".*PKCS#12 bundle could not be parsed as DER.*")
+
 def get_env_bool(key, default="True"):
     val = str(os.getenv(key, default)).lower().strip()
     return val in ("true", "1", "t", "y", "yes")
+
+# --- Init Database ---
+if DB_AVAILABLE:
+    try:
+        get_db().init_db()
+    except Exception as e:
+        st.sidebar.error(f"Error conectando a BBDD: {e}")
+        DB_AVAILABLE = False
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -159,7 +179,19 @@ def get_client():
         with open(k_path, "wb") as f:
             f.write(key_file.getbuffer())
 
-    return HospedajesClient(
+    # Check if we can reuse the existing client
+    config_hash = f"{wsdl}-{endpoint}-{user}-{pwd}-{c_path}-{k_path}-{verify_ssl}-{mock_mode}"
+    if st.session_state.client and st.session_state.get('config_hash') == config_hash:
+        return st.session_state.client
+
+    # Close old client if exists
+    if st.session_state.client:
+        try:
+            st.session_state.client.close()
+        except:
+            pass
+
+    client = HospedajesClient(
         wsdl_path=wsdl,
         endpoint=endpoint,
         username=user,
@@ -169,6 +201,27 @@ def get_client():
         verify_ssl=verify_ssl,
         mock_mode=mock_mode
     )
+    
+    st.session_state.client = client
+    st.session_state.config_hash = config_hash
+    return client
+
+# --- Catalog Helper ---
+def load_catalog(tipo, defaults):
+    if 'cat_cache' not in st.session_state:
+        st.session_state.cat_cache = {}
+        
+    if tipo not in st.session_state.cat_cache:
+        mapping = {k: k for k in defaults}
+        if DB_AVAILABLE:
+            try:
+                db_data = get_db().get_catalogo(tipo)
+                if db_data:
+                    mapping = {item['codigo']: f"{item['codigo']} - {item['descripcion']}" for item in db_data}
+            except:
+                pass
+        st.session_state.cat_cache[tipo] = mapping
+    return st.session_state.cat_cache[tipo]
 
 # --- Main Content ---
 st.title("🏨 MIR Hospedajes - Portal de Comunicaciones")
@@ -222,7 +275,8 @@ with tabs[0]:
             st.write("💳 Datos de Pago")
             p_col1, p_col2 = st.columns([1, 3])
             with p_col1:
-                tipo_pago = st.selectbox("Tipo de Pago", ["EF", "TC", "TR", "OT"], help="EF: Efectivo, TC: Tarjeta, TR: Transferencia, OT: Otros")
+                cat_pago = load_catalog("TIPO_PAGO", ["EF", "TC", "TR", "OT"])
+                tipo_pago = st.selectbox("Tipo de Pago", options=list(cat_pago.keys()), format_func=lambda x: cat_pago[x], help="Selecciona según el catálogo oficial")
                 f_pago = st.date_input("Fecha de Pago", datetime.now())
                 p_caducidad = st.text_input("Caducidad Tarjeta", value="", placeholder="MM/AAAA", help="Solo para TC")
             with p_col2:
@@ -259,9 +313,12 @@ with tabs[0]:
                     p_soporte = st.text_input(label_soporte, "", key=f"soporte_{i}", help="Ej: IDESP... para NIF o E... para NIE")
                 
                 with v2:
-                    p_tdoc = st.selectbox(f"Tipo Doc P{i+1}", ["NIF", "NIE", "PAS", "ID"], key=f"tdoc_{i}")
+                    cat_tdoc = load_catalog("TIPO_DOCUMENTO", ["NIF", "NIE", "PAS", "ID"])
+                    p_tdoc = st.selectbox(f"Tipo Doc P{i+1}", options=list(cat_tdoc.keys()), format_func=lambda x: cat_tdoc[x], key=f"tdoc_{i}")
                     p_doc = st.text_input(f"Documento P{i+1}", "12345678Z", key=f"doc_{i}")
-                    p_sexo = st.selectbox(f"Sexo P{i+1}", ["M", "F", "X"], key=f"sexo_{i}")
+                    
+                    cat_sexo = load_catalog("SEXO", ["M", "F", "X"])
+                    p_sexo = st.selectbox(f"Sexo P{i+1}", options=list(cat_sexo.keys()), format_func=lambda x: cat_sexo[x], key=f"sexo_{i}")
                     p_fnac = st.date_input(f"Fecha Nacimiento P{i+1}", datetime(1980, 1, 1), key=f"fnac_{i}")
                 
                 # Calcular si es menor de edad (18 años)
@@ -270,7 +327,10 @@ with tabs[0]:
                 v3, v4 = st.columns(2)
                 with v3:
                     p_nac = st.text_input(f"Nacionalidad P{i+1}", "ESP", key=f"nac_{i}")
-                    p_parentesco = st.selectbox(f"Parentesco P{i+1}", ["", "P", "M", "A", "H", "O"], help="P: Padre, M: Madre, A: Abuelo, H: Hermano, O: Otros", key=f"par_{i}")
+                    
+                    cat_parentesco = load_catalog("TIPO_PARENTESCO", ["", "P", "M", "A", "H", "O"])
+                    p_parentesco = st.selectbox(f"Parentesco P{i+1}", options=list(cat_parentesco.keys()), format_func=lambda x: cat_parentesco[x] if x else "Ninguno", key=f"par_{i}")
+                    
                     if es_menor and not p_parentesco:
                         st.warning(f"Persona {i+1} es menor. El parentesco es obligatorio.")
                 with v4:
@@ -289,12 +349,15 @@ with tabs[0]:
                 
                 # Direccion
                 st.write(f"🏠 Dirección P{i+1}")
-                d1, d2, d3 = st.columns([2, 1, 1])
+                d1, d2, d3, d4 = st.columns([2, 2, 1, 1])
                 with d1:
                     d_dir = st.text_input(f"Dirección P{i+1}", "CALLE FALSA 123", key=f"dir_{i}")
                 with d2:
-                    d_cp = st.text_input(f"CP P{i+1}", "28001", key=f"cp_{i}")
+                    cat_mun = load_catalog("MUNICIPIO", ["28079"])
+                    d_mun = st.selectbox(f"Municipio P{i+1}", options=list(cat_mun.keys()), format_func=lambda x: cat_mun[x] if x in cat_mun else x, key=f"mun_{i}", help="Escribe para buscar el municipio")
                 with d3:
+                    d_cp = st.text_input(f"CP P{i+1}", "28001", key=f"cp_{i}")
+                with d4:
                     d_pais = st.text_input(f"País P{i+1}", "ESP", key=f"dpais_{i}")
 
                 # Update session state with current values
@@ -306,7 +369,7 @@ with tabs[0]:
                     'tipoDocumento': p_tdoc, 'numeroDocumento': p_doc, 'soporteDocumento': p_soporte,
                     'fechaNacimiento': p_fnac.strftime('%Y-%m-%d'), 'nacionalidad': p_nac, 'sexo': p_sexo,
                     'telefono': p_tel, 'correo': p_email, 'parentesco': p_parentesco,
-                    'direccion': {'direccion': d_dir, 'codigoPostal': d_cp, 'pais': d_pais}
+                    'direccion': {'direccion': d_dir, 'codigoMunicipio': d_mun, 'codigoPostal': d_cp, 'pais': d_pais}
                 })
         
         st.divider()
@@ -320,6 +383,8 @@ with tabs[0]:
                     errors.append(f"Persona {i+1}: Falta el número de soporte (Obligatorio para {p['tipoDocumento']})")
                 if not p.get('telefono') and not p.get('correo'):
                     errors.append(f"Persona {i+1}: Debe indicar al menos un teléfono o correo")
+                if not p['direccion'].get('codigoMunicipio'):
+                    errors.append(f"Persona {i+1}: El municipio es obligatorio")
                 
                 # Check for minor
                 dob = datetime.strptime(p['fechaNacimiento'], '%Y-%m-%d').date()
@@ -372,8 +437,8 @@ with tabs[1]:
         if op_consulta == "Número de Lote":
             res = client.consulta_lote([search_val])
         else:
-            # Placeholder for consultaComunicacion
-            res = {"info": "Consulta de comunicación individual", "valor": search_val}
+            res = client.consulta_comunicacion([search_val])
+        
         st.write("### Resultado")
         st.json(res)
 
@@ -382,23 +447,93 @@ with tabs[2]:
     st.header("Anulación de Comunicaciones")
     lote_anular = st.text_input("Número de Lote a anular completamente")
     
-    if st.button("Anular Lote"):
-        st.warning(f"¿Estás seguro de que deseas anular el lote {lote_anular}?")
-        if st.button("Confirmar Anulación"):
+    confirmar = st.checkbox("Estoy seguro de que deseo anular este lote de forma irreversible.")
+    
+    if st.button("Anular Lote", type="primary", disabled=not confirmar):
+        if lote_anular:
             client = get_client()
-            # Call anulacionLote
-            st.success("Solicitud de anulación enviada")
+            res = client.anulacion_lote(lote_anular)
+            st.write("### Resultado")
+            st.json(res)
+            if "error" not in res:
+                st.success("Solicitud de anulación enviada y procesada.")
+        else:
+            st.error("Debes introducir un número de lote válido.")
 
 # --- TAB: Catálogo ---
 with tabs[3]:
     st.header("Consulta de Catálogos")
-    cat_target = st.selectbox("Catálogo", ["PAISES", "TIPOS_DOCUMENTO", "ROLES_PERSONA", "MARCAS_VEHICULOS"])
+    cat_target = st.selectbox("Catálogo", [
+        "SEXO", 
+        "TIPO_DOCUMENTO", 
+        "TIPO_MARCA_VEHICULO", 
+        "TIPO_PAGO", 
+        "TIPO_PARENTESCO", 
+        "TIPO_COLOR", 
+        "TIPO_ESTABLECIMIENTO", 
+        "TIPO_VEHICULO"
+    ])
     
-    if st.button("Cargar Catálogo"):
-        client = get_client()
-        res = client.catalogo(cat_target)
-        st.write(f"### Datos de {cat_target}")
-        st.json(res)
+    col_btn1, col_btn2 = st.columns(2)
+    
+    with col_btn1:
+        if st.button("🌐 Cargar del Ministerio"):
+            client = get_client()
+            res = client.catalogo(cat_target)
+            
+            if "error" in res:
+                st.error(res["error"])
+                if res.get("details"):
+                    st.info(res["details"])
+                
+                if res.get("fallback"):
+                    st.warning(f"Usando datos de respaldo (Offline) para {cat_target}")
+                    df = pd.DataFrame(res["local_data"])
+                    st.dataframe(df, use_container_width=True)
+            else:
+                st.success(f"Datos de {cat_target} cargados desde el servidor")
+                try:
+                    # Parse data
+                    if 'respuesta' in res and 'resultado' in res['respuesta']:
+                        data = res['respuesta']['resultado'].get('tupla', [])
+                        parsed_data = [{'codigo': t['codigo'], 'descripcion': t['descripcion']} for t in data]
+                    else:
+                        parsed_data = res.get('data', [])
+                    
+                    df = pd.DataFrame(parsed_data)
+                    
+                    if not df.empty:
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Save to DB automatically
+                        if DB_AVAILABLE:
+                            try:
+                                get_db().save_catalogo(cat_target, parsed_data)
+                                st.success(f"✅ Catálogo {cat_target} sincronizado en NeonDB.")
+                            except Exception as db_e:
+                                st.error(f"Error al guardar en BBDD: {db_e}")
+                    else:
+                        st.write("El catálogo está vacío o no se ha podido procesar.")
+                        st.json(res)
+                except Exception as e:
+                    st.json(res)
+                    st.error(f"Error al procesar el formato de respuesta: {e}")
+
+    with col_btn2:
+        if st.button("🗄️ Cargar desde NeonDB"):
+            if not DB_AVAILABLE:
+                st.error("La conexión a la base de datos no está disponible.")
+            else:
+                try:
+                    db_data = get_db().get_catalogo(cat_target)
+                    if db_data:
+                        df = pd.DataFrame(db_data)
+                        st.success(f"Catálogo {cat_target} cargado desde NeonDB (Última act: {db_data[0].get('last_updated')})")
+                        st.dataframe(df, use_container_width=True)
+                    else:
+                        st.warning(f"El catálogo {cat_target} no está en la base de datos todavía. Por favor cárgalo desde el Ministerio primero.")
+                except Exception as db_e:
+                    st.error(f"Error al leer de la BBDD: {db_e}")
 
 # --- Footer ---
 st.divider()
